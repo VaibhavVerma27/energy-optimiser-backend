@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from predictor import predict_24h, get_recent_from_csv
 from decision_engine import detect_overloads, demand_response, REGION_CAPACITIES_MW
+from capacity_engine import compute_dynamic_capacity, REGION_INSTALLED
 
 router = APIRouter()
 
@@ -63,7 +64,7 @@ def _load_model(region_col: str):
 
 
 def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], start_dt: datetime) -> dict:
-    """Run forecast + decision engine for one region column."""
+    """Run forecast + dynamic capacity + decision engine for one region column."""
     model = _load_model(region_col)
 
     # Use provided data or load from CSV
@@ -74,38 +75,81 @@ def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], 
             raise FileNotFoundError("data/demand.csv not found. Run prepare_dataset.py first.")
         history = get_recent_from_csv(DATA_PATH, region_col=region_col, hours=168)
 
-    forecast = predict_24h(model, history, start_dt)
+    forecast_raw = predict_24h(model, history, start_dt)
+    region_id    = REGION_ID_MAP.get(region_col, "ALL_INDIA")
+    doy          = start_dt.timetuple().tm_yday
 
-    region_id = REGION_ID_MAP.get(region_col, "ALL_INDIA")
-    capacity  = REGION_CAPACITIES_MW.get(region_id, REGION_CAPACITIES_MW["ALL_INDIA"])
+    # Compute dynamic capacity per hour — NOT fixed anymore
+    enhanced_forecast = []
+    capacity_timeline = []
+    for f in forecast_raw:
+        hour  = f["hour"]
+        month = start_dt.month
+        dyn   = compute_dynamic_capacity(region_id, hour, month,
+                                         current_demand_mw=f["predicted_demand_mw"],
+                                         day_of_year=doy)
+        dynamic_cap = dyn.total_available_mw
 
-    # Add capacity and baseline to each forecast hour
-    for f in forecast:
-        f["capacity_mw"] = capacity
-        f["historical_baseline_mw"] = round(f["predicted_demand_mw"] * 0.95)
+        enhanced_forecast.append({
+            **f,
+            "capacity_mw":           dynamic_cap,
+            "historical_baseline_mw": round(f["predicted_demand_mw"] * 0.95),
+            "solar_available_mw":    dyn.breakdown.get("solar", 0),
+            "wind_available_mw":     dyn.breakdown.get("wind", 0),
+            "hydro_available_mw":    dyn.breakdown.get("hydro", 0),
+            "thermal_available_mw":  dyn.breakdown.get("thermal", 0),
+            "renewable_available_mw": round(
+                dyn.breakdown.get("solar", 0) +
+                dyn.breakdown.get("wind", 0) +
+                dyn.breakdown.get("hydro", 0), 1
+            ),
+            "capacity_alerts":       dyn.alerts,
+        })
+        capacity_timeline.append({
+            "hour":             hour,
+            "label":            f["label"],
+            "total_capacity_mw": dynamic_cap,
+            "solar_cf":         dyn.capacity_factors.get("solar", 0),
+            "wind_cf":          dyn.capacity_factors.get("wind", 0),
+            "hydro_cf":         dyn.capacity_factors.get("hydro", 0),
+            "thermal_cf":       dyn.capacity_factors.get("thermal", 0),
+            "breakdown_mw":     dyn.breakdown,
+            "alerts":           dyn.alerts,
+        })
 
-    overloads = detect_overloads(forecast, capacity_mw=capacity, region=region_id)
-    dr = demand_response(overloads, region=region_id)
+    # Detect overloads using per-hour dynamic capacity
+    overload_results = []
+    from decision_engine import OverloadResult
+    for f in enhanced_forecast:
+        pred = f["predicted_demand_mw"]
+        cap  = f["capacity_mw"]
+        overload_results.append(OverloadResult(
+            hour=f["hour"], timestamp=f["timestamp"], label=f["label"],
+            predicted_mw=pred, is_overload=pred > cap,
+            excess_mw=round(max(0, pred - cap), 1), region=region_id,
+        ))
 
-    # Add adjusted demand to forecast
+    dr     = demand_response(overload_results, region=region_id)
     adj_map = {a["hour"]: a["adjusted_mw"] for a in dr["adjusted_curve"]}
-    for f in forecast:
+    for f in enhanced_forecast:
         f["adjusted_demand_mw"] = adj_map.get(f["hour"], f["predicted_demand_mw"])
 
-    peak = max(forecast, key=lambda x: x["predicted_demand_mw"])
+    peak    = max(enhanced_forecast, key=lambda x: x["predicted_demand_mw"])
+    peak_cap = next((f["capacity_mw"] for f in enhanced_forecast if f["hour"] == peak["hour"]), 0)
 
     return {
-        "region_col":   region_col,
-        "region_label": REGION_LABEL.get(region_col, region_col),
-        "region_id":    region_id,
-        "forecast":     forecast,
+        "region_col":        region_col,
+        "region_label":      REGION_LABEL.get(region_col, region_col),
+        "region_id":         region_id,
+        "forecast":          enhanced_forecast,
+        "capacity_timeline": capacity_timeline,
         "overload_summary": {
             "overload_detected":    dr["total_overload_hours"] > 0,
             "total_overload_hours": dr["total_overload_hours"],
             "peak_predicted_mw":    peak["predicted_demand_mw"],
             "peak_hour":            peak["label"],
-            "capacity_mw":          capacity,
-            "excess_mw":            round(max(0, peak["predicted_demand_mw"] - capacity), 1),
+            "capacity_mw":          peak_cap,
+            "excess_mw":            round(max(0, peak["predicted_demand_mw"] - peak_cap), 1),
         },
         "demand_response": dr,
     }

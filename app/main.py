@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routers import forecast, status, demand
+from routers import forecast, status, demand, capacity
 
 app = FastAPI(
     title="Smart Grid AI API",
@@ -34,6 +34,7 @@ app.add_middleware(
 app.include_router(forecast.router, prefix="/api/forecast", tags=["Forecast"])
 app.include_router(status.router, prefix="/api/status", tags=["Status"])
 app.include_router(demand.router, prefix="/api/demand", tags=["Demand"])
+app.include_router(capacity.router, prefix="/api/capacity", tags=["Capacity"])
 
 
 @app.get("/")

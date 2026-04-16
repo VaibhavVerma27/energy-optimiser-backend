@@ -94,11 +94,17 @@ def detect_overloads(
     capacity_mw: float = DEFAULT_CAPACITY_MW,
     region: str = "ALL_INDIA",
 ) -> List[OverloadResult]:
-    """Module 5: Flag each hour where predicted demand exceeds capacity."""
+    """
+    Module 5: Flag each hour where predicted demand exceeds available capacity.
+    Uses per-hour dynamic capacity from forecast["capacity_mw"] if present,
+    otherwise falls back to the fixed capacity_mw argument.
+    """
     results = []
-    cap = REGION_CAPACITIES_MW.get(region, capacity_mw)
+    fixed_cap = REGION_CAPACITIES_MW.get(region, capacity_mw)
     for entry in forecast:
         pred = entry["predicted_demand_mw"]
+        # Use per-hour dynamic capacity if the forecast includes it
+        cap = entry.get("capacity_mw", fixed_cap)
         excess = max(0.0, pred - cap)
         results.append(OverloadResult(
             hour=entry["hour"],
