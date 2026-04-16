@@ -1,183 +1,254 @@
 """
 API Router: /api/forecast
---------------------------
-POST /api/forecast/predict   — Run 24h demand forecast + decision engine
-GET  /api/forecast/mock      — Return realistic mock data (no model required)
+POST /api/forecast/all-regions   — Predict all 5 regions + national in one call
+POST /api/forecast/region        — Predict a single region
 """
 
-import sys
-import os
-# Point to app/ folder so sibling modules (predictor, decision_engine, model) resolve
+import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-import numpy as np
 from datetime import datetime, timedelta
+from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import List, Optional
 
-from predictor import predict_24h
-from decision_engine import detect_overloads, demand_response
+from predictor import predict_24h, get_recent_from_csv
+from decision_engine import detect_overloads, demand_response, REGION_CAPACITIES_MW
 
 router = APIRouter()
 
-# ── Request / Response schemas ──────────────────────────────────────────────
+DATA_PATH   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "demand.csv")
+MODELS_DIR  = os.path.dirname(os.path.abspath(__file__)) + "/.."
 
-class ForecastRequest(BaseModel):
-    recent_demand: List[float]          # At least 168 hourly MW values
-    start_datetime: Optional[str] = None  # ISO format; defaults to now
-    capacity_mw: Optional[float] = 10000
-    ev_delay_hours: Optional[int] = 2
-    industrial_curtail_pct: Optional[float] = 0.15
+ALL_REGION_COLS = [
+    "Northern_Region_mw",
+    "Western_Region_mw",
+    "Eastern_Region_mw",
+    "Southern_Region_mw",
+    "NorthEastern_Region_mw",
+]
+
+REGION_LABEL = {
+    "Northern_Region_mw":    "Northern Region",
+    "Western_Region_mw":     "Western Region",
+    "Eastern_Region_mw":     "Eastern Region",
+    "Southern_Region_mw":    "Southern Region",
+    "NorthEastern_Region_mw":"North-Eastern Region",
+    "demand_mw":             "National",
+}
+
+REGION_ID_MAP = {
+    "Northern_Region_mw":    "Northern_Region",
+    "Western_Region_mw":     "Western_Region",
+    "Eastern_Region_mw":     "Eastern Region",
+    "Southern_Region_mw":    "Southern_Region",
+    "NorthEastern_Region_mw":"NorthEastern_Region",
+    "demand_mw":             "ALL_INDIA",
+}
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
-
-@router.post("/predict")
-def forecast_predict(req: ForecastRequest):
-    """
-    Full pipeline:
-      1. Load trained model
-      2. Recursive 24h prediction
-      3. Overload detection
-      4. Demand-response decision engine
-    Returns complete forecast + action plan.
-    """
-    try:
-        from model import load_model
-        model = load_model()
-    except FileNotFoundError:
-        raise HTTPException(
-            status_code=503,
-            detail="Model not trained yet. Run train.py first."
+def _load_model(region_col: str):
+    import joblib
+    path = os.path.join(MODELS_DIR, f"model_{region_col}.joblib")
+    if not os.path.exists(path):
+        # Fallback to national model
+        fallback = os.path.join(MODELS_DIR, "model_demand_mw.joblib")
+        if os.path.exists(fallback):
+            return joblib.load(fallback)
+        raise FileNotFoundError(
+            f"No model found for {region_col}.\n"
+            f"Run: python train.py --data data/demand.csv"
         )
+    return joblib.load(path)
 
-    if len(req.recent_demand) < 168:
-        raise HTTPException(
-            status_code=400,
-            detail="Need at least 168 hours of historical demand data."
-        )
 
+def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], start_dt: datetime) -> dict:
+    """Run forecast + decision engine for one region column."""
+    model = _load_model(region_col)
+
+    # Use provided data or load from CSV
+    if recent_demand and len(recent_demand) >= 168:
+        history = recent_demand
+    else:
+        if not os.path.exists(DATA_PATH):
+            raise FileNotFoundError("data/demand.csv not found. Run prepare_dataset.py first.")
+        history = get_recent_from_csv(DATA_PATH, region_col=region_col, hours=168)
+
+    forecast = predict_24h(model, history, start_dt)
+
+    region_id = REGION_ID_MAP.get(region_col, "ALL_INDIA")
+    capacity  = REGION_CAPACITIES_MW.get(region_id, REGION_CAPACITIES_MW["ALL_INDIA"])
+
+    # Add capacity and baseline to each forecast hour
+    for f in forecast:
+        f["capacity_mw"] = capacity
+        f["historical_baseline_mw"] = round(f["predicted_demand_mw"] * 0.95)
+
+    overloads = detect_overloads(forecast, capacity_mw=capacity, region=region_id)
+    dr = demand_response(overloads, region=region_id)
+
+    # Add adjusted demand to forecast
+    adj_map = {a["hour"]: a["adjusted_mw"] for a in dr["adjusted_curve"]}
+    for f in forecast:
+        f["adjusted_demand_mw"] = adj_map.get(f["hour"], f["predicted_demand_mw"])
+
+    peak = max(forecast, key=lambda x: x["predicted_demand_mw"])
+
+    return {
+        "region_col":   region_col,
+        "region_label": REGION_LABEL.get(region_col, region_col),
+        "region_id":    region_id,
+        "forecast":     forecast,
+        "overload_summary": {
+            "overload_detected":    dr["total_overload_hours"] > 0,
+            "total_overload_hours": dr["total_overload_hours"],
+            "peak_predicted_mw":    peak["predicted_demand_mw"],
+            "peak_hour":            peak["label"],
+            "capacity_mw":          capacity,
+            "excess_mw":            round(max(0, peak["predicted_demand_mw"] - capacity), 1),
+        },
+        "demand_response": dr,
+    }
+
+
+# ── Request schemas ───────────────────────────────────────────────────────────
+
+class AllRegionsForecastRequest(BaseModel):
+    # Optional: supply 168+ recent values per region for more accurate predictions.
+    # If omitted, uses last 168 rows from data/demand.csv automatically.
+    Northern_Region_mw:    Optional[List[float]] = None
+    Western_Region_mw:     Optional[List[float]] = None
+    Eastern_Region_mw:     Optional[List[float]] = None
+    Southern_Region_mw:    Optional[List[float]] = None
+    NorthEastern_Region_mw:Optional[List[float]] = None
+    demand_mw:             Optional[List[float]] = None
+    start_datetime:        Optional[str] = None
+
+
+class SingleRegionRequest(BaseModel):
+    region_col:     str             # e.g. "Northern_Region_mw"
+    recent_demand:  Optional[List[float]] = None
+    start_datetime: Optional[str] = None
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post("/all-regions")
+def forecast_all_regions(req: AllRegionsForecastRequest):
+    """
+    Predict next 24h for all 5 regions + national demand simultaneously.
+    Uses last 168 rows from data/demand.csv if no data provided.
+    """
     start_dt = (
         datetime.fromisoformat(req.start_datetime)
         if req.start_datetime
         else datetime.utcnow().replace(minute=0, second=0, microsecond=0)
     )
 
-    forecast = predict_24h(model, req.recent_demand, start_dt)
-    overloads = detect_overloads(forecast, capacity_mw=req.capacity_mw)
-    response_plan = demand_response(
-        overloads,
-        ev_delay_hours=req.ev_delay_hours,
-        industrial_curtail_pct=req.industrial_curtail_pct,
-    )
+    supplied = {
+        "demand_mw":              req.demand_mw,
+        "Northern_Region_mw":     req.Northern_Region_mw,
+        "Western_Region_mw":      req.Western_Region_mw,
+        "Eastern_Region_mw":      req.Eastern_Region_mw,
+        "Southern_Region_mw":     req.Southern_Region_mw,
+        "NorthEastern_Region_mw": req.NorthEastern_Region_mw,
+    }
+
+    results = {}
+    errors  = {}
+    all_india_predicted  = [0.0] * 24
+    all_india_adjusted   = [0.0] * 24
+
+    cols_to_forecast = ["demand_mw"] + ALL_REGION_COLS
+
+    for col in cols_to_forecast:
+        try:
+            data = _forecast_one_region(col, supplied.get(col), start_dt)
+            results[col] = data
+            if col != "demand_mw":
+                for i, f in enumerate(data["forecast"]):
+                    all_india_predicted[i] += f["predicted_demand_mw"]
+                    all_india_adjusted[i]  += f["adjusted_demand_mw"]
+        except FileNotFoundError as e:
+            errors[col] = str(e)
+        except Exception as e:
+            errors[col] = str(e)
+
+    if not results:
+        raise HTTPException(status_code=503, detail=f"All forecasts failed: {errors}")
+
+    # Build All-India aggregated series
+    all_india_forecast = []
+    for i in range(24):
+        dt = start_dt + timedelta(hours=i)
+        all_india_forecast.append({
+            "hour": i,
+            "timestamp": dt.isoformat(),
+            "label": f"{i:02d}:00",
+            "predicted_demand_mw":  round(all_india_predicted[i], 1),
+            "adjusted_demand_mw":   round(all_india_adjusted[i], 1),
+            "historical_baseline_mw": round(all_india_predicted[i] * 0.95),
+            "capacity_mw": REGION_CAPACITIES_MW["ALL_INDIA"],
+        })
+
+    total_peak = max(all_india_predicted) if all_india_predicted else 0
 
     return {
-        "forecast": forecast,
-        "overload_summary": {
-            "total_overload_hours": response_plan["total_overload_hours"],
-            "peak_predicted_mw": response_plan["peak_predicted_mw"],
-            "capacity_mw": response_plan["capacity_mw"],
-            "overload_detected": response_plan["total_overload_hours"] > 0,
+        "regions":  results,
+        "all_india": {
+            "forecast":       all_india_forecast,
+            "peak_mw":        round(total_peak, 1),
+            "capacity_mw":    REGION_CAPACITIES_MW["ALL_INDIA"],
+            "utilisation_pct": round((total_peak / REGION_CAPACITIES_MW["ALL_INDIA"]) * 100, 1),
         },
-        "demand_response": response_plan,
+        "errors":       errors,
         "generated_at": datetime.utcnow().isoformat(),
     }
 
 
-@router.get("/mock")
-def forecast_mock():
-    """
-    Returns realistic pre-computed mock data for frontend development.
-    No trained model required.
-    """
-    base = [5200,4900,4700,4600,4650,5100,5900,6800,7600,8200,
-            8700,9100,9400,9600,9800,9900,9600,9100,8400,7800,
-            7100,6500,5900,5400]
-    predicted = [5380,5020,4810,4720,4800,5280,6050,7020,7850,8480,
-                 8960,9350,9650,10100,10847,10620,10200,9480,8620,8020,
-                 7280,6640,6050,5520]
-    adjusted = [5380,5020,4810,4720,4800,5280,6050,7020,7850,8480,
-                8960,9350,9400,9480,9600,9520,9300,9100,8620,8020,
-                7280,7080,7150,6820]
+@router.post("/region")
+def forecast_single_region(req: SingleRegionRequest):
+    """Predict next 24h for a single region."""
+    start_dt = (
+        datetime.fromisoformat(req.start_datetime)
+        if req.start_datetime
+        else datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    )
+    try:
+        return _forecast_one_region(req.region_col, req.recent_demand, start_dt)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    now = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    forecast = []
-    for i in range(24):
-        dt = now + timedelta(hours=i)
-        forecast.append({
-            "hour": i,
-            "timestamp": dt.isoformat(),
-            "label": dt.strftime("%H:00"),
-            "predicted_demand_mw": predicted[i],
-            "historical_baseline_mw": base[i],
-            "adjusted_demand_mw": adjusted[i],
-            "capacity_mw": 10000,
-        })
 
-    overload_hours = [f for f in forecast if f["predicted_demand_mw"] > 10000]
-    peak = max(forecast, key=lambda x: x["predicted_demand_mw"])
+@router.get("/status")
+def forecast_status():
+    """Check which models are trained and data availability."""
+    import glob as _glob
+
+    models_found = {}
+    cols = ["demand_mw"] + ALL_REGION_COLS
+    for col in cols:
+        path = os.path.join(MODELS_DIR, f"model_{col}.joblib")
+        models_found[col] = os.path.exists(path)
+
+    data_ok = os.path.exists(DATA_PATH)
+    data_rows = 0
+    data_date_range = None
+    if data_ok:
+        try:
+            import pandas as pd
+            df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+            data_rows = len(df)
+            data_date_range = f"{df['timestamp'].min()} → {df['timestamp'].max()}"
+        except Exception:
+            pass
 
     return {
-        "forecast": forecast,
-        "model_metrics": {
-            "mae": 182.4,
-            "rmse": 241.1,
-            "r2": 0.9412,
-            "accuracy_pct": 96.2,
-            "model_type": "RandomForest",
-            "n_estimators": 100,
-            "train_test_split": "80/20",
-        },
-        "overload_summary": {
-            "overload_detected": True,
-            "total_overload_hours": len(overload_hours),
-            "peak_predicted_mw": peak["predicted_demand_mw"],
-            "peak_hour": peak["label"],
-            "capacity_mw": 10000,
-            "excess_mw": round(peak["predicted_demand_mw"] - 10000, 1),
-        },
-        "demand_response": {
-            "total_reduction_mw": 920,
-            "peak_adjusted_mw": max(adjusted),
-            "still_overloaded_hours": 0,
-            "actions": [
-                {
-                    "name": "EV Charging Delay",
-                    "type": "reduction",
-                    "reduction_mw": 340,
-                    "description": "EV load shifted +2 hours to 22:00–00:00 window",
-                    "affected_segment": "ev_charging",
-                    "impact_level": "low",
-                },
-                {
-                    "name": "Industrial Curtailment",
-                    "type": "reduction",
-                    "reduction_mw": 420,
-                    "description": "Industrial load reduced 15% during 13:00–17:00",
-                    "affected_segment": "industrial",
-                    "impact_level": "medium",
-                },
-                {
-                    "name": "Backup Generation",
-                    "type": "supply",
-                    "reduction_mw": 160,
-                    "description": "Peaker plant (gas turbine #3) on standby",
-                    "affected_segment": "supply",
-                    "impact_level": "high",
-                },
-            ],
-            "segment_breakdown": {
-                "residential": {"share_pct": 40, "peak_load_mw": 4338.8},
-                "industrial":  {"share_pct": 40, "peak_load_mw": 4338.8},
-                "ev_charging": {"share_pct": 20, "peak_load_mw": 2169.4},
-            },
-            "adjusted_curve": [
-                {"hour": i, "label": f"{i:02d}:00",
-                 "original_mw": predicted[i], "adjusted_mw": adjusted[i],
-                 "still_overloaded": adjusted[i] > 10000}
-                for i in range(24)
-            ],
-        },
-        "generated_at": datetime.utcnow().isoformat(),
+        "models": models_found,
+        "all_models_ready": all(models_found.values()),
+        "data_file": data_ok,
+        "data_rows": data_rows,
+        "data_date_range": data_date_range,
     }

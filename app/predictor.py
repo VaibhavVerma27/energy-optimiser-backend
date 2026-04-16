@@ -1,95 +1,90 @@
 """
 Module 4: Prediction Engine
-----------------------------
-Recursive 24-hour demand forecasting.
-Each predicted hour feeds back as input for the next hour (recursive strategy).
+Recursive 24-step forecasting using a trained model.
+India-specific: uses IST-aware features.
 """
 
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List
+from preprocessing import FEATURE_COLS
 
 
-def build_single_feature_row(
-    recent_demand: list,      # Most recent demand values (at least 168 entries)
-    target_datetime: datetime,
+def build_feature_row(
+    recent_demand: list,
+    target_dt: datetime,
     rolling_7d_mean: float,
     rolling_7d_max: float,
+    rolling_7d_std: float,
 ) -> np.ndarray:
+    """Build one feature row matching FEATURE_COLS order."""
+    hour        = target_dt.hour
+    dow         = target_dt.weekday()
+    month       = target_dt.month
+
+    row = {
+        "lag_1h":          recent_demand[-1],
+        "lag_2h":          recent_demand[-2],
+        "lag_3h":          recent_demand[-3],
+        "lag_24h":         recent_demand[-24],
+        "lag_48h":         recent_demand[-48],
+        "lag_72h":         recent_demand[-72],
+        "lag_96h":         recent_demand[-96],
+        "rolling_7d_mean": rolling_7d_mean,
+        "rolling_7d_max":  rolling_7d_max,
+        "rolling_7d_std":  rolling_7d_std,
+        "hour_sin":        np.sin(2 * np.pi * hour / 24),
+        "hour_cos":        np.cos(2 * np.pi * hour / 24),
+        "month_sin":       np.sin(2 * np.pi * month / 12),
+        "month_cos":       np.cos(2 * np.pi * month / 12),
+        "is_weekend":      int(dow >= 5),
+        "day_of_week":     dow,
+        "is_morning_peak": int(7 <= hour <= 10),
+        "is_evening_peak": int(18 <= hour <= 22),
+        "is_summer":       int(month in [4, 5, 6]),
+        "is_winter":       int(month in [11, 12, 1]),
+        "is_monsoon":      int(month in [7, 8, 9]),
+    }
+
+    return np.array([[row[f] for f in FEATURE_COLS]])
+
+
+def predict_24h(model, recent_demand: list, start_datetime: datetime) -> List[dict]:
     """
-    Construct one feature row for prediction.
-    Mirrors the feature engineering from preprocessing.py.
-    """
-    hour = target_datetime.hour
-    month = target_datetime.month
-    day_of_week = target_datetime.weekday()
-    is_weekend = int(day_of_week >= 5)
-
-    hour_sin = np.sin(2 * np.pi * hour / 24)
-    hour_cos = np.cos(2 * np.pi * hour / 24)
-    month_sin = np.sin(2 * np.pi * month / 12)
-    month_cos = np.cos(2 * np.pi * month / 12)
-
-    # Lag features — index from end of recent_demand list
-    lag_1h  = recent_demand[-1]
-    lag_2h  = recent_demand[-2]
-    lag_3h  = recent_demand[-3]
-    lag_24h = recent_demand[-24]
-    lag_48h = recent_demand[-48]
-    lag_72h = recent_demand[-72]
-    lag_96h = recent_demand[-96]
-
-    return np.array([[
-        lag_1h, lag_2h, lag_3h,
-        lag_24h, lag_48h, lag_72h, lag_96h,
-        rolling_7d_mean, rolling_7d_max,
-        hour_sin, hour_cos,
-        month_sin, month_cos,
-        is_weekend, day_of_week,
-    ]])
-
-
-def predict_24h(
-    model,
-    recent_demand: list,   # At least 168 historical hourly values (7 days)
-    start_datetime: datetime,
-) -> List[dict]:
-    """
-    Recursively forecast the next 24 hours.
-
-    Args:
-        model: Trained scikit-learn model
-        recent_demand: List of recent hourly demand values (at least 168)
-        start_datetime: The first hour to forecast (e.g., datetime(2024, 7, 1, 0, 0))
-
-    Returns:
-        List of dicts: [{hour, timestamp, predicted_demand_mw}, ...]
+    Recursively forecast next 24 hours.
+    recent_demand must have at least 168 values (7 days).
     """
     if len(recent_demand) < 168:
-        raise ValueError("Need at least 168 hours (7 days) of historical demand to forecast.")
+        raise ValueError(f"Need ≥168 hours of history, got {len(recent_demand)}")
 
-    demand_buffer = list(recent_demand)  # Copy so we don't mutate the original
+    buffer = list(recent_demand)
+    rolling_7d_mean = float(np.mean(buffer[-168:]))
+    rolling_7d_max  = float(np.max(buffer[-168:]))
+    rolling_7d_std  = float(np.std(buffer[-168:]))
+
     results = []
-
-    rolling_7d_mean = float(np.mean(demand_buffer[-168:]))
-    rolling_7d_max  = float(np.max(demand_buffer[-168:]))
-
     for step in range(24):
         target_dt = start_datetime + timedelta(hours=step)
-        features = build_single_feature_row(
-            demand_buffer, target_dt, rolling_7d_mean, rolling_7d_max
-        )
+        features  = build_feature_row(buffer, target_dt, rolling_7d_mean, rolling_7d_max, rolling_7d_std)
         predicted = float(model.predict(features)[0])
-        predicted = max(0, predicted)  # Clamp negative predictions
+        predicted = max(0.0, round(predicted, 1))
 
-        demand_buffer.append(predicted)  # Feed prediction back as lag for next step
-
+        buffer.append(predicted)
         results.append({
-            "hour": step,
-            "timestamp": target_dt.isoformat(),
-            "label": target_dt.strftime("%H:00"),
-            "predicted_demand_mw": round(predicted, 1),
+            "hour":                step,
+            "timestamp":          target_dt.isoformat(),
+            "label":              f"{step:02d}:00",
+            "predicted_demand_mw": predicted,
         })
 
     return results
+
+
+def get_recent_from_csv(filepath: str, region_col: str = "demand_mw", hours: int = 168) -> list:
+    """Read last N hours of a region column from demand.csv."""
+    df = pd.read_csv(filepath, parse_dates=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    if region_col not in df.columns:
+        raise ValueError(f"Column '{region_col}' not in {filepath}")
+    return df[region_col].dropna().tail(hours).tolist()

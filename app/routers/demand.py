@@ -1,71 +1,66 @@
 """
 API Router: /api/demand
-------------------------
-GET /api/demand/recent        — Returns latest 168 hourly MW values from demand.csv
-GET /api/demand/recent?hours=N — Returns latest N hourly values (min 168)
+GET /api/demand/recent           — Last 168h for all regions
+GET /api/demand/recent?region=X  — Last 168h for one region
 """
 
-import sys
-import os
+import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query
-from datetime import datetime
+from decision_engine import REGION_CAPACITIES_MW
 
 router = APIRouter()
 
-# Path to the prepared dataset — relative to app/ folder
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "demand.csv")
 
-
-def load_recent_demand(hours: int = 168) -> list:
-    """
-    Reads demand.csv and returns the latest `hours` MW values as a list.
-    Minimum 168 (7 days) required for the forecasting model.
-    """
-    if not os.path.exists(DATA_PATH):
-        raise FileNotFoundError(
-            f"demand.csv not found at {DATA_PATH}. "
-            "Run prepare_dataset.py first to generate it."
-        )
-
-    df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    df = df.dropna(subset=["demand_mw"])
-
-    if len(df) < 168:
-        raise ValueError(f"Dataset too small: {len(df)} rows. Need at least 168.")
-
-    # Take the last `hours` rows
-    recent = df.tail(hours)
-
-    return {
-        "recent_demand": recent["demand_mw"].round(1).tolist(),
-        "hours": len(recent),
-        "from_timestamp": recent["timestamp"].iloc[0].isoformat(),
-        "to_timestamp": recent["timestamp"].iloc[-1].isoformat(),
-        "mean_mw": round(recent["demand_mw"].mean(), 1),
-        "max_mw": round(recent["demand_mw"].max(), 1),
-        "min_mw": round(recent["demand_mw"].min(), 1),
-    }
+ALL_MW_COLS = [
+    "demand_mw",
+    "Northern_Region_mw",
+    "Western_Region_mw",
+    "Eastern_Region_mw",
+    "Southern_Region_mw",
+    "NorthEastern_Region_mw",
+]
 
 
 @router.get("/recent")
-def get_recent_demand(
-    hours: int = Query(default=168, ge=168, le=720,
-                       description="Number of recent hourly values to return (min 168, max 720)")
+def get_recent(
+    region: str = Query(default=None, description="e.g. Northern_Region_mw or demand_mw"),
+    hours:  int = Query(default=168, ge=168, le=720),
 ):
-    """
-    Returns the latest hourly demand values from demand.csv.
-    Use the returned `recent_demand` array directly in fetchLiveForecast().
-    """
-    try:
-        result = load_recent_demand(hours)
+    if not os.path.exists(DATA_PATH):
+        raise HTTPException(status_code=404, detail="data/demand.csv not found. Run prepare_dataset.py.")
+
+    df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    if region:
+        if region not in df.columns:
+            avail = [c for c in df.columns if "mw" in c.lower()]
+            raise HTTPException(status_code=422, detail=f"Column '{region}' not found. Available: {avail}")
+        recent = df.tail(hours)
+        cap = REGION_CAPACITIES_MW.get(region.replace("_mw",""), REGION_CAPACITIES_MW["ALL_INDIA"])
+        return {
+            "region":       region,
+            "recent_demand":recent[region].round(1).tolist(),
+            "hours":        len(recent),
+            "from":         recent["timestamp"].iloc[0].isoformat(),
+            "to":           recent["timestamp"].iloc[-1].isoformat(),
+            "mean_mw":      round(recent[region].mean(), 1),
+            "max_mw":       round(recent[region].max(), 1),
+            "capacity_mw":  cap,
+        }
+    else:
+        # Return all available columns
+        recent = df.tail(hours)
+        result = {
+            "hours": len(recent),
+            "from":  recent["timestamp"].iloc[0].isoformat(),
+            "to":    recent["timestamp"].iloc[-1].isoformat(),
+        }
+        for col in ALL_MW_COLS:
+            if col in recent.columns:
+                result[col] = recent[col].round(1).tolist()
         return result
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load demand data: {str(e)}")
