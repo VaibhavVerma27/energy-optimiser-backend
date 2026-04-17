@@ -1,28 +1,16 @@
 """
 Modules 5 & 6: Overload Detection + Decision Engine
------------------------------------------------------
-Calibrated for India's 5-region POSOCO grid (CEA 2023-24 data).
+India POSOCO Grid — CEA 2023-24
 
-Region capacities (installed, CEA 2023-24):
-  Northern  : 115,000 MW  (UP, Delhi, Rajasthan, Punjab, Haryana, HP, J&K)
-  Western   : 130,000 MW  (Gujarat, Maharashtra, MP, Chhattisgarh, Goa)
-  Southern  :  95,000 MW  (AP, Telangana, Karnataka, Tamil Nadu, Kerala)
-  Eastern   :  55,000 MW  (West Bengal, Odisha, Bihar, Jharkhand)
-  NE        :   4,500 MW  (Assam, Meghalaya, Manipur, Mizoram, Nagaland etc)
-  All-India : ~399,500 MW
-
-Costs in Indian Rupees (₹/MWh):
-  Backup peaker (gas)   : ₹8,500/MWh
-  Industrial curtailment: ₹2,200/MWh savings
-  EV shift incentive    : ₹600/MWh
-  CO₂ gas peaker        : 490 kg/MWh
-  CO₂ grid average      : 820 kg/MWh (India coal-heavy mix)
+Key design: each OverloadResult carries its OWN per-hour dynamic capacity
+so demand_response strategies work against the actual available MW at that
+hour (not a single fixed number for all 24 hours).
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 
-# ── Region capacities (MW) ────────────────────────────────────────────────────
+# ── Installed capacities (MW) — CEA 2023-24 ─────────────────────────────────
 REGION_CAPACITIES_MW = {
     "Northern_Region":      115000,
     "Western_Region":       130000,
@@ -31,30 +19,26 @@ REGION_CAPACITIES_MW = {
     "NorthEastern_Region":    4500,
     "ALL_INDIA":            399500,
 }
-
-# Default capacity for single-region mode
 DEFAULT_CAPACITY_MW = 399500
 
-# Demand segment shares
+# India demand segment shares (different from US/Europe)
 SEGMENT_SHARES = {
-    "residential": 0.26,   # India: lower residential share vs US
-    "industrial":  0.45,   # India: higher industrial share
-    "agriculture": 0.18,   # India-specific: large agricultural load
+    "residential": 0.26,
+    "industrial":  0.45,
+    "agriculture": 0.18,  # India-specific: schedulable irrigation pumps
     "commercial":  0.11,
 }
+EV_SHARE = 0.04  # Low but growing
 
-# India-specific EV share (low, but growing)
-EV_SHARE = 0.04
-
-# Cost constants (₹/MWh)
-COST_BACKUP_PER_MWH     = 8500
-COST_INDUSTRY_SAVE_MWH  = 2200
-COST_EV_INCENTIVE_MWH   = 600
-COST_AGRI_INCENTIVE_MWH = 400
+# India cost constants (₹/MWh)
+COST_BACKUP_PER_MWH    = 8500
+COST_INDUSTRY_SAVE_MWH = 2200
+COST_EV_INCENTIVE_MWH  = 600
+COST_AGRI_INCENTIVE_MWH= 400
 
 # Carbon (kg CO₂/MWh)
-CO2_BACKUP_KG_MWH  = 490   # Gas peaker
-CO2_GRID_KG_MWH    = 820   # India grid average (coal-heavy)
+CO2_BACKUP_KG_MWH = 490   # Gas peaker
+CO2_GRID_KG_MWH   = 820   # India coal-heavy grid average
 
 
 @dataclass
@@ -66,6 +50,8 @@ class OverloadResult:
     is_overload: bool
     excess_mw: float
     region: str = "ALL_INDIA"
+    # Per-hour dynamic capacity — set by forecast router
+    available_capacity_mw: float = 0.0
 
 
 @dataclass
@@ -80,31 +66,22 @@ class ActionResult:
     co2_kg: float = 0.0
 
 
-@dataclass
-class HourAdjustment:
-    hour: int
-    label: str
-    original_mw: float
-    adjusted_mw: float
-    actions_applied: List[str] = field(default_factory=list)
-
-
 def detect_overloads(
     forecast: List[dict],
     capacity_mw: float = DEFAULT_CAPACITY_MW,
     region: str = "ALL_INDIA",
 ) -> List[OverloadResult]:
     """
-    Module 5: Flag each hour where predicted demand exceeds available capacity.
-    Uses per-hour dynamic capacity from forecast["capacity_mw"] if present,
-    otherwise falls back to the fixed capacity_mw argument.
+    Flag each hour where predicted demand exceeds available capacity.
+    Reads per-hour 'capacity_mw' from forecast if present (dynamic),
+    otherwise uses the fixed capacity_mw fallback.
     """
     results = []
     fixed_cap = REGION_CAPACITIES_MW.get(region, capacity_mw)
     for entry in forecast:
         pred = entry["predicted_demand_mw"]
-        # Use per-hour dynamic capacity if the forecast includes it
-        cap = entry.get("capacity_mw", fixed_cap)
+        # Use dynamic per-hour capacity if the forecast has it
+        cap = float(entry.get("capacity_mw") or fixed_cap)
         excess = max(0.0, pred - cap)
         results.append(OverloadResult(
             hour=entry["hour"],
@@ -114,6 +91,7 @@ def detect_overloads(
             is_overload=pred > cap,
             excess_mw=round(excess, 1),
             region=region,
+            available_capacity_mw=cap,  # store per-hour capacity
         ))
     return results
 
@@ -124,31 +102,40 @@ def demand_response(
     industrial_curtail_pct: float = 0.15,
     agri_shift_pct: float = 0.10,
     backup_supply_mw: float = 2000.0,
-    capacity_mw: float = None,
     region: str = "ALL_INDIA",
 ) -> Dict:
     """
-    Module 6: India-specific demand response cascade.
+    India demand response cascade — uses per-hour dynamic capacity from
+    each OverloadResult.available_capacity_mw.
 
-    Strategy order:
-    1. EV charging delay (low impact — small share but easy to shift)
-    2. Agricultural pump load shift (India-specific — schedulable loads)
-    3. Industrial curtailment (highest MW impact)
-    4. Backup generation (gas peakers / diesel)
+    Cascade order:
+    1. EV charging delay          (low impact, easy to shift)
+    2. Agricultural pump deferral (India-specific, schedulable)
+    3. Industrial curtailment     (highest MW impact under DSM)
+    4. Backup generation          (gas peakers / diesel, last resort)
     """
     n = len(overload_results)
-    cap = capacity_mw or REGION_CAPACITIES_MW.get(region, DEFAULT_CAPACITY_MW)
+    if n == 0:
+        return _empty_response(region)
+
+    # Mutable demand array — we reduce this as strategies are applied
     demand = [r.predicted_mw for r in overload_results]
+    # Per-hour capacity array (dynamic)
+    caps = [
+        r.available_capacity_mw if r.available_capacity_mw > 0
+        else REGION_CAPACITIES_MW.get(region, DEFAULT_CAPACITY_MW)
+        for r in overload_results
+    ]
     actions_summary: List[ActionResult] = []
 
-    # Strategy 1: EV Delay
+    # ── Strategy 1: EV Charging Delay ────────────────────────────────────────
     ev_reduction = {}
-    for r in overload_results:
+    for i, r in enumerate(overload_results):
         if r.is_overload:
             ev_load = r.predicted_mw * EV_SHARE
-            demand[r.hour] -= ev_load
+            demand[i] -= ev_load
             ev_reduction[r.hour] = ev_load
-            target = min(r.hour + ev_delay_hours, n - 1)
+            target = min(i + ev_delay_hours, n - 1)
             demand[target] += ev_load
 
     total_ev = sum(ev_reduction.values())
@@ -157,19 +144,18 @@ def demand_response(
             name="EV Charging Delay",
             type="reduction",
             reduction_mw=round(total_ev / max(len(ev_reduction), 1), 1),
-            description=f"EV load shifted +{ev_delay_hours}h to off-peak window (4% of demand)",
+            description=f"EV loads (4% of demand) shifted +{ev_delay_hours}h to off-peak window",
             affected_segment="ev_charging",
             impact_level="low",
             cost_inr=round((total_ev / 1000) * COST_EV_INCENTIVE_MWH),
             co2_kg=0,
         ))
 
-    # Strategy 2: Agricultural pump shift (India-specific)
+    # ── Strategy 2: Agricultural Pump Deferral ────────────────────────────────
     agri_reduction = {}
     for i, r in enumerate(overload_results):
-        if demand[i] > cap:
-            agri_load = r.predicted_mw * SEGMENT_SHARES["agriculture"]
-            cut = agri_load * agri_shift_pct
+        if demand[i] > caps[i]:
+            cut = r.predicted_mw * SEGMENT_SHARES["agriculture"] * agri_shift_pct
             demand[i] -= cut
             agri_reduction[r.hour] = cut
 
@@ -179,19 +165,18 @@ def demand_response(
             name="Agricultural Pump Deferral",
             type="reduction",
             reduction_mw=round(total_agri / max(len(agri_reduction), 1), 1),
-            description=f"Irrigation pump loads deferred by 2-3h (18% agri segment, {int(agri_shift_pct*100)}% shifted)",
+            description=f"Irrigation pumps deferred 2-3h (18% agri segment, {int(agri_shift_pct*100)}% shifted)",
             affected_segment="agriculture",
             impact_level="low",
             cost_inr=round((total_agri / 1000) * COST_AGRI_INCENTIVE_MWH),
             co2_kg=0,
         ))
 
-    # Strategy 3: Industrial curtailment
+    # ── Strategy 3: Industrial Curtailment ────────────────────────────────────
     industrial_reduction = {}
     for i, r in enumerate(overload_results):
-        if demand[i] > cap:
-            ind_load = r.predicted_mw * SEGMENT_SHARES["industrial"]
-            cut = ind_load * industrial_curtail_pct
+        if demand[i] > caps[i]:
+            cut = r.predicted_mw * SEGMENT_SHARES["industrial"] * industrial_curtail_pct
             demand[i] -= cut
             industrial_reduction[r.hour] = cut
 
@@ -201,99 +186,104 @@ def demand_response(
             name="Industrial Curtailment",
             type="reduction",
             reduction_mw=round(total_ind / max(len(industrial_reduction), 1), 1),
-            description=f"Industrial segment ({int(SEGMENT_SHARES['industrial']*100)}%) reduced {int(industrial_curtail_pct*100)}% under DSM regulations",
+            description=f"Industrial loads (45% segment) reduced {int(industrial_curtail_pct*100)}% under DSM",
             affected_segment="industrial",
             impact_level="medium",
-            cost_inr=round((total_ind / 1000) * COST_INDUSTRY_SAVE_MWH * -1),  # negative = savings
+            cost_inr=round((total_ind / 1000) * COST_INDUSTRY_SAVE_MWH * -1),
             co2_kg=round((total_ind / 1000) * CO2_GRID_KG_MWH * -1),
         ))
 
-    # Strategy 4: Backup generation
+    # ── Strategy 4: Backup Generation ────────────────────────────────────────
     backup_hours = []
-    total_backup = 0
+    total_backup = 0.0
     for i, r in enumerate(overload_results):
-        if demand[i] > cap:
-            add = min(demand[i] - cap, backup_supply_mw)
+        if demand[i] > caps[i]:
+            needed = demand[i] - caps[i]
+            add = min(needed, backup_supply_mw)
             demand[i] -= add
             total_backup += add
-            backup_hours.append(r.hour)
+            backup_hours.append(r.label)
 
-    if backup_hours:
+    if total_backup > 0:
         actions_summary.append(ActionResult(
             name="Backup Generation",
             type="supply",
-            reduction_mw=round(backup_supply_mw, 1),
-            description=f"Gas peaker / diesel DG sets activated during hours {backup_hours[:3]}{'...' if len(backup_hours)>3 else ''}",
+            reduction_mw=round(total_backup / max(len(backup_hours), 1), 1),
+            description=f"Gas peakers / diesel DG sets activated at hours: {', '.join(backup_hours[:4])}{'...' if len(backup_hours)>4 else ''}",
             affected_segment="supply",
             impact_level="high",
             cost_inr=round((total_backup / 1000) * COST_BACKUP_PER_MWH),
             co2_kg=round((total_backup / 1000) * CO2_BACKUP_KG_MWH),
         ))
 
-    # Build adjusted curve
+    # ── Build adjusted curve ──────────────────────────────────────────────────
     adjustments = []
     for i, r in enumerate(overload_results):
         applied = []
-        if r.hour in ev_reduction:       applied.append("EV Delay")
-        if r.hour in agri_reduction:     applied.append("Agri Shift")
+        if r.hour in ev_reduction:         applied.append("EV Delay")
+        if r.hour in agri_reduction:       applied.append("Agri Shift")
         if r.hour in industrial_reduction: applied.append("Industrial Cut")
-        if r.hour in backup_hours:       applied.append("Backup Gen")
-        adjustments.append(HourAdjustment(
-            hour=r.hour,
-            label=r.label,
-            original_mw=round(r.predicted_mw, 1),
-            adjusted_mw=round(demand[i], 1),
-            actions_applied=applied,
-        ))
+        if r.label in backup_hours:        applied.append("Backup Gen")
+        adjustments.append({
+            "hour":             r.hour,
+            "label":            r.label,
+            "original_mw":      round(r.predicted_mw, 1),
+            "adjusted_mw":      round(demand[i], 1),
+            "capacity_mw":      caps[i],
+            "actions_applied":  applied,
+            "still_overloaded": demand[i] > caps[i],
+        })
 
-    overload_hours   = [r for r in overload_results if r.is_overload]
-    peak_predicted   = max((r.predicted_mw for r in overload_results), default=0)
-    peak_adjusted    = max(demand)
-    total_reduction  = sum(r.predicted_mw - demand[r.hour] for r in overload_results)
-    still_overloaded = sum(1 for i, r in enumerate(overload_results) if demand[i] > cap)
-
-    # Cost totals
-    total_cost_inr = sum(a.cost_inr for a in actions_summary)
-    total_co2_kg   = sum(a.co2_kg for a in actions_summary)
+    # ── Summary stats ─────────────────────────────────────────────────────────
+    overload_hours    = [r for r in overload_results if r.is_overload]
+    peak_predicted    = max((r.predicted_mw for r in overload_results), default=0)
+    peak_adjusted     = max(demand)
+    total_reduction   = sum(r.predicted_mw - demand[r.hour] for r in overload_results)
+    still_overloaded  = sum(1 for i in range(n) if demand[i] > caps[i])
+    total_cost_inr    = sum(a.cost_inr for a in actions_summary)
+    total_co2_kg      = sum(a.co2_kg for a in actions_summary)
 
     return {
-        "region": region,
-        "capacity_mw": cap,
-        "peak_predicted_mw": round(peak_predicted, 1),
-        "peak_adjusted_mw": round(peak_adjusted, 1),
-        "total_overload_hours": len(overload_hours),
-        "still_overloaded_hours": still_overloaded,
-        "total_reduction_mw": round(total_reduction, 1),
-        "total_cost_inr": round(total_cost_inr),
-        "total_co2_kg": round(total_co2_kg),
+        "region":                region,
+        "total_overload_hours":  len(overload_hours),
+        "still_overloaded_hours":still_overloaded,
+        "peak_predicted_mw":     round(peak_predicted, 1),
+        "peak_adjusted_mw":      round(peak_adjusted, 1),
+        "total_reduction_mw":    round(total_reduction, 1),
+        "total_cost_inr":        round(total_cost_inr),
+        "total_co2_kg":          round(total_co2_kg),
         "actions": [
             {
-                "name": a.name, "type": a.type,
-                "reduction_mw": a.reduction_mw,
-                "description": a.description,
+                "name":             a.name,
+                "type":             a.type,
+                "reduction_mw":     a.reduction_mw,
+                "description":      a.description,
                 "affected_segment": a.affected_segment,
-                "impact_level": a.impact_level,
-                "cost_inr": a.cost_inr,
-                "co2_kg": a.co2_kg,
+                "impact_level":     a.impact_level,
+                "cost_inr":         a.cost_inr,
+                "co2_kg":           a.co2_kg,
             }
             for a in actions_summary
         ],
-        "adjusted_curve": [
-            {
-                "hour": adj.hour, "label": adj.label,
-                "original_mw": adj.original_mw,
-                "adjusted_mw": adj.adjusted_mw,
-                "actions_applied": adj.actions_applied,
-                "still_overloaded": adj.adjusted_mw > cap,
-            }
-            for adj in adjustments
-        ],
+        "adjusted_curve": adjustments,
         "segment_breakdown": {
             seg: {
-                "share_pct": int(share * 100),
-                "peak_load_mw": round(peak_predicted * share, 1),
+                "share_pct":     int(share * 100),
+                "peak_load_mw":  round(peak_predicted * share, 1),
             }
             for seg, share in {**SEGMENT_SHARES, "ev_charging": EV_SHARE}.items()
         },
-        "region_capacities": REGION_CAPACITIES_MW,
+    }
+
+
+def _empty_response(region: str) -> Dict:
+    return {
+        "region": region, "total_overload_hours": 0, "still_overloaded_hours": 0,
+        "peak_predicted_mw": 0, "peak_adjusted_mw": 0, "total_reduction_mw": 0,
+        "total_cost_inr": 0, "total_co2_kg": 0,
+        "actions": [], "adjusted_curve": [],
+        "segment_breakdown": {
+            seg: {"share_pct": int(s*100), "peak_load_mw": 0}
+            for seg, s in {**SEGMENT_SHARES, "ev_charging": EV_SHARE}.items()
+        },
     }
