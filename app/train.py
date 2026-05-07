@@ -33,13 +33,16 @@ ALL_COLUMNS = [
 ]
 
 
-def train_one(data_path: str, region_col: str, model_type: str) -> dict:
+def train_one(data_path: str, region_col: str, model_type: str,
+              use_weather: bool = True, use_holidays: bool = True) -> dict:
     model_path = f"model_{region_col}.joblib"
     print(f"\n{'='*55}")
     print(f"Training: {region_col}")
     print(f"{'='*55}")
 
-    df, X, y, feature_names = preprocess_pipeline(data_path, region_col=region_col)
+    df, X, y, feature_names = preprocess_pipeline(data_path, region_col=region_col,
+                                               use_weather=use_weather,
+                                               use_holidays=use_holidays)
     print(f"Samples: {X.shape[0]:,} | Features: {X.shape[1]}")
 
     model, metrics, importances = full_training_pipeline(
@@ -64,6 +67,8 @@ def main():
     parser.add_argument("--data",  required=True, help="Path to demand.csv")
     parser.add_argument("--model", default="rf", choices=["rf", "lr"],
                         help="rf=RandomForest (default), lr=LinearRegression")
+    parser.add_argument("--no-weather",  action="store_true", help="Skip weather features")
+    parser.add_argument("--no-holidays", action="store_true", help="Skip holiday features")
     args = parser.parse_args()
 
     if not os.path.exists(args.data):
@@ -82,7 +87,9 @@ def main():
     all_metrics = {}
     for col in cols_to_train:
         try:
-            all_metrics[col] = train_one(args.data, col, args.model)
+            all_metrics[col] = train_one(args.data, col, args.model,
+                                             use_weather=not args.no_weather,
+                                             use_holidays=not args.no_holidays)
         except Exception as e:
             print(f"  FAILED for {col}: {e}")
 

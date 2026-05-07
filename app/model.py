@@ -49,14 +49,32 @@ def evaluate_model(model, X_test, y_test):
     }
 
 
-def save_model(model, path=DEFAULT_MODEL_PATH):
+def save_model(model, path=DEFAULT_MODEL_PATH, feature_cols=None):
+    """Save model. Also saves feature_cols as a sidecar .json file so
+    inference always uses exactly the same features the model was trained on."""
     joblib.dump(model, path)
+    if feature_cols is not None:
+        import json
+        meta_path = path.replace(".joblib", "_meta.json")
+        with open(meta_path, "w") as f:
+            json.dump({"feature_cols": feature_cols, "n_features": len(feature_cols)}, f, indent=2)
 
 
 def load_model(path=DEFAULT_MODEL_PATH):
     if not os.path.exists(path):
         raise FileNotFoundError(f"No model at {path}. Run train.py first.")
     return joblib.load(path)
+
+
+def load_feature_cols(path=DEFAULT_MODEL_PATH):
+    """Load the feature_cols list saved alongside a model. Returns None if not found."""
+    import json
+    from preprocessing import BASE_FEATURE_COLS
+    meta_path = path.replace(".joblib", "_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            return json.load(f)["feature_cols"]
+    return list(BASE_FEATURE_COLS)   # backward compat — old models used only base features
 
 
 def load_region_model(region: str):
@@ -66,7 +84,18 @@ def load_region_model(region: str):
         return joblib.load(region_path)
     if os.path.exists(DEFAULT_MODEL_PATH):
         return joblib.load(DEFAULT_MODEL_PATH)
-    raise FileNotFoundError("No model found. Run: python train.py --data data/demand.csv --model rf")
+    raise FileNotFoundError("No model found. Run: python train.py --data data/demand.csv")
+
+
+def load_region_model_with_meta(region: str):
+    """Load model + feature_cols together."""
+    region_path = f"model_{region}.joblib"
+    actual_path = region_path if os.path.exists(region_path) else DEFAULT_MODEL_PATH
+    if not os.path.exists(actual_path):
+        raise FileNotFoundError("No model found. Run: python train.py --data data/demand.csv")
+    model = joblib.load(actual_path)
+    feature_cols = load_feature_cols(actual_path)
+    return model, feature_cols
 
 
 def feature_importances(model, feature_names):
@@ -80,6 +109,7 @@ def full_training_pipeline(X, y, feature_names, model_type="rf", model_path=DEFA
     print(f"  Train: {len(X_train):,} | Test: {len(X_test):,}")
     model = train_model(X_train, y_train, model_type)
     metrics = evaluate_model(model, X_test, y_test)
-    save_model(model, model_path)
+    # Save model AND feature_cols sidecar
+    save_model(model, model_path, feature_cols=list(feature_names))
     importances = feature_importances(model, feature_names)
     return model, metrics, importances

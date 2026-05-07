@@ -15,6 +15,66 @@ from pydantic import BaseModel
 from predictor import predict_24h, get_recent_from_csv
 from decision_engine import detect_overloads, demand_response, REGION_CAPACITIES_MW
 from capacity_engine import compute_dynamic_capacity, REGION_INSTALLED
+from model import load_region_model_with_meta
+
+def _get_weather_for_forecast(start_dt, hours: int = 24) -> list:
+    """Pull actual weather data from demand.csv for the forecast window if available."""
+    try:
+        import pandas as pd
+        from datetime import timedelta
+        df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+        weather_hours = []
+        for i in range(hours):
+            ts = start_dt + timedelta(hours=i)
+            row = df[df["timestamp"] == ts]
+            if not row.empty:
+                weather_hours.append({
+                    "solar_irradiance_wm2": float(row["northern_solar_wm2"].iloc[0])
+                        if "northern_solar_wm2" in row.columns else None,
+                    "ambient_temp_c": float(row["northern_temp_c"].iloc[0])
+                        if "northern_temp_c" in row.columns else None,
+                    "wind_speed_ms": None,   # not in dataset yet
+                })
+            else:
+                weather_hours.append({})
+        return weather_hours if any(w for w in weather_hours) else []
+    except Exception:
+        return []
+
+def _get_region_weather(start_dt, region_id: str, hours: int = 24) -> list:
+    """Pull region-specific weather from demand.csv for the forecast window."""
+    prefix_map = {
+        "Northern_Region":     "northern",
+        "Western_Region":      "western",
+        "Southern_Region":     "southern",
+        "Eastern_Region":      "eastern",
+        "NorthEastern_Region": "ne",
+        "ALL_INDIA":           "northern",
+    }
+    prefix = prefix_map.get(region_id, "northern")
+    try:
+        import pandas as pd
+        from datetime import timedelta
+        df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+        weather_hours = []
+        for i in range(hours):
+            ts  = start_dt + timedelta(hours=i)
+            row = df[df["timestamp"] == ts]
+            if not row.empty:
+                solar_col = f"{prefix}_solar_wm2"
+                temp_col  = f"{prefix}_temp_c"
+                weather_hours.append({
+                    "solar_irradiance_wm2": float(row[solar_col].iloc[0])
+                        if solar_col in row.columns else None,
+                    "ambient_temp_c": float(row[temp_col].iloc[0])
+                        if temp_col in row.columns else None,
+                    "wind_speed_ms": None,
+                })
+            else:
+                weather_hours.append({})
+        return weather_hours if any(w.get("solar_irradiance_wm2") is not None for w in weather_hours) else []
+    except Exception:
+        return []
 
 router = APIRouter()
 
@@ -49,23 +109,24 @@ REGION_ID_MAP = {
 
 
 def _load_model(region_col: str):
-    import joblib
-    path = os.path.join(MODELS_DIR, f"model_{region_col}.joblib")
-    if not os.path.exists(path):
-        # Fallback to national model
-        fallback = os.path.join(MODELS_DIR, "model_demand_mw.joblib")
-        if os.path.exists(fallback):
-            return joblib.load(fallback)
+    """Load model + feature_cols. Returns (model, feature_cols)."""
+    orig_dir = os.getcwd()
+    try:
+        os.chdir(MODELS_DIR)
+        model, feature_cols = load_region_model_with_meta(region_col)
+        return model, feature_cols
+    except FileNotFoundError:
         raise FileNotFoundError(
             f"No model found for {region_col}.\n"
             f"Run: python train.py --data data/demand.csv"
         )
-    return joblib.load(path)
+    finally:
+        os.chdir(orig_dir)
 
 
 def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], start_dt: datetime) -> dict:
     """Run forecast + dynamic capacity + decision engine for one region column."""
-    model = _load_model(region_col)
+    model, feature_cols = _load_model(region_col)
 
     # Use provided data or load from CSV
     if recent_demand and len(recent_demand) >= 168:
@@ -75,35 +136,47 @@ def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], 
             raise FileNotFoundError("data/demand.csv not found. Run prepare_dataset.py first.")
         history = get_recent_from_csv(DATA_PATH, region_col=region_col, hours=168)
 
-    forecast_raw = predict_24h(model, history, start_dt)
+    forecast_raw = predict_24h(model, history, start_dt,
+                                feature_cols=feature_cols,
+                                confidence=True, ci_level=0.80)
     region_id    = REGION_ID_MAP.get(region_col, "ALL_INDIA")
     doy          = start_dt.timetuple().tm_yday
 
-    # Compute dynamic capacity per hour — NOT fixed anymore
+    # Compute dynamic capacity per hour — weather-enhanced when data available
+    region_weather = _get_region_weather(start_dt, region_id, hours=24)
     enhanced_forecast = []
     capacity_timeline = []
     for f in forecast_raw:
         hour  = f["hour"]
         month = start_dt.month
-        dyn   = compute_dynamic_capacity(region_id, hour, month,
-                                         current_demand_mw=f["predicted_demand_mw"],
-                                         day_of_year=doy)
+        wx    = region_weather[hour] if hour < len(region_weather) else {}
+        dyn   = compute_dynamic_capacity(
+            region_id, hour, month,
+            current_demand_mw=f["predicted_demand_mw"],
+            day_of_year=doy,
+            solar_irradiance_wm2=wx.get("solar_irradiance_wm2"),
+            ambient_temp_c=wx.get("ambient_temp_c"),
+            wind_speed_ms=wx.get("wind_speed_ms"),
+        )
         dynamic_cap = dyn.total_available_mw
 
         enhanced_forecast.append({
             **f,
-            "capacity_mw":           dynamic_cap,
+            "capacity_mw":            dynamic_cap,
             "historical_baseline_mw": round(f["predicted_demand_mw"] * 0.95),
-            "solar_available_mw":    dyn.breakdown.get("solar", 0),
-            "wind_available_mw":     dyn.breakdown.get("wind", 0),
-            "hydro_available_mw":    dyn.breakdown.get("hydro", 0),
-            "thermal_available_mw":  dyn.breakdown.get("thermal", 0),
+            "solar_available_mw":     dyn.breakdown.get("solar", 0),
+            "wind_available_mw":      dyn.breakdown.get("wind", 0),
+            "hydro_available_mw":     dyn.breakdown.get("hydro", 0),
+            "thermal_available_mw":   dyn.breakdown.get("thermal", 0),
             "renewable_available_mw": round(
                 dyn.breakdown.get("solar", 0) +
                 dyn.breakdown.get("wind", 0) +
                 dyn.breakdown.get("hydro", 0), 1
             ),
-            "capacity_alerts":       dyn.alerts,
+            "capacity_alerts":        dyn.alerts,
+            "weather_enhanced_cap":   dyn.weather_enhanced,
+            "solar_cf":               dyn.capacity_factors.get("solar", 0),
+            "wind_cf":                dyn.capacity_factors.get("wind", 0),
         })
         capacity_timeline.append({
             "hour":             hour,
