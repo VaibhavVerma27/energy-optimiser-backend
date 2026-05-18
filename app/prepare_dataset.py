@@ -12,7 +12,8 @@ Expected Excel columns (exact names from the file):
   - Southern Region Hourly Demand
   - North-Eastern Region Hourly Demand
 
-Usage:
+Usage:/
+
     python prepare_dataset.py --file data/india_load.xlsx
     python prepare_dataset.py --file data/india_load.xlsx --start-year 2019
 

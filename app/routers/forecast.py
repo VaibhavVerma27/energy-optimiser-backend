@@ -41,8 +41,15 @@ def _get_weather_for_forecast(start_dt, hours: int = 24) -> list:
     except Exception:
         return []
 
-def _get_region_weather(start_dt, region_id: str, hours: int = 24) -> list:
-    """Pull region-specific weather from demand.csv for the forecast window."""
+def _get_region_weather(start_dt, region_id: str, hours: int = 24,
+                        user_weather: dict = None) -> list:
+    """
+    Get hourly weather for capacity calculation.
+    Priority:
+      1. User-supplied weather override (from the dashboard Weather tab)
+      2. Historical data from demand.csv (only works for past dates)
+      3. Empty list → capacity engine uses seasonal fallback
+    """
     prefix_map = {
         "Northern_Region":     "northern",
         "Western_Region":      "western",
@@ -52,27 +59,60 @@ def _get_region_weather(start_dt, region_id: str, hours: int = 24) -> list:
         "ALL_INDIA":           "northern",
     }
     prefix = prefix_map.get(region_id, "northern")
+
+    # Priority 1: user supplied weather from the input panel
+    if user_weather:
+        temp_c    = float(user_weather.get("temp_c",    30.0))
+        humidity  = float(user_weather.get("humidity",  60.0))
+        solar_wm2 = user_weather.get("solar_wm2")  # None = use seasonal
+
+        result = []
+        for h in range(hours):
+            # Derive solar irradiance from time-of-day if not provided
+            if solar_wm2 is None:
+                # Simple bell curve from user temp context
+                import math
+                hour = (start_dt.hour + h) % 24
+                if 6 <= hour <= 18:
+                    bell = math.exp(-0.5 * ((hour - 12) / 3.5) ** 2)
+                    # Scale by expected clear-sky vs actual (humidity proxy for cloud cover)
+                    cloud_factor = max(0.3, 1.0 - max(0, humidity - 50) * 0.008)
+                    derived_solar = bell * 950 * cloud_factor
+                else:
+                    derived_solar = 0.0
+                result.append({
+                    "solar_irradiance_wm2": round(derived_solar, 1),
+                    "ambient_temp_c":       temp_c,
+                    "wind_speed_ms":        None,
+                })
+            else:
+                result.append({
+                    "solar_irradiance_wm2": float(solar_wm2),
+                    "ambient_temp_c":       temp_c,
+                    "wind_speed_ms":        None,
+                })
+        return result
+
+    # Priority 2: historical data from demand.csv (works for past dates)
     try:
         import pandas as pd
         from datetime import timedelta
         df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
         weather_hours = []
+        found_any = False
         for i in range(hours):
             ts  = start_dt + timedelta(hours=i)
             row = df[df["timestamp"] == ts]
             if not row.empty:
                 solar_col = f"{prefix}_solar_wm2"
                 temp_col  = f"{prefix}_temp_c"
-                weather_hours.append({
-                    "solar_irradiance_wm2": float(row[solar_col].iloc[0])
-                        if solar_col in row.columns else None,
-                    "ambient_temp_c": float(row[temp_col].iloc[0])
-                        if temp_col in row.columns else None,
-                    "wind_speed_ms": None,
-                })
+                s = float(row[solar_col].iloc[0]) if solar_col in row.columns else None
+                t = float(row[temp_col].iloc[0])  if temp_col  in row.columns else None
+                if s is not None: found_any = True
+                weather_hours.append({"solar_irradiance_wm2": s, "ambient_temp_c": t, "wind_speed_ms": None})
             else:
                 weather_hours.append({})
-        return weather_hours if any(w.get("solar_irradiance_wm2") is not None for w in weather_hours) else []
+        return weather_hours if found_any else []
     except Exception:
         return []
 
@@ -124,11 +164,11 @@ def _load_model(region_col: str):
         os.chdir(orig_dir)
 
 
-def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], start_dt: datetime) -> dict:
+def _forecast_one_region(region_col: str, recent_demand, start_dt,
+                          weather_override=None, holiday_override=None) -> dict:
     """Run forecast + dynamic capacity + decision engine for one region column."""
     model, feature_cols = _load_model(region_col)
 
-    # Use provided data or load from CSV
     if recent_demand and len(recent_demand) >= 168:
         history = recent_demand
     else:
@@ -143,7 +183,9 @@ def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], 
     doy          = start_dt.timetuple().tm_yday
 
     # Compute dynamic capacity per hour — weather-enhanced when data available
-    region_weather = _get_region_weather(start_dt, region_id, hours=24)
+    # Priority: user-supplied → CSV historical → seasonal fallback
+    region_weather = _get_region_weather(start_dt, region_id, hours=24,
+                                          user_weather=weather_override)
     enhanced_forecast = []
     capacity_timeline = []
     for f in forecast_raw:
@@ -200,6 +242,7 @@ def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], 
             hour=f["hour"], timestamp=f["timestamp"], label=f["label"],
             predicted_mw=pred, is_overload=pred > cap,
             excess_mw=round(max(0, pred - cap), 1), region=region_id,
+            available_capacity_mw=cap,   # FIX: was 0.0 default — demand_response needs this
         ))
 
     dr     = demand_response(overload_results, region=region_id)
@@ -230,6 +273,19 @@ def _forecast_one_region(region_col: str, recent_demand: Optional[List[float]], 
 
 # ── Request schemas ───────────────────────────────────────────────────────────
 
+class WeatherOverride(BaseModel):
+    """Per-region weather for capacity calculation."""
+    temp_c:    float = 30.0   # ambient temperature (°C)
+    humidity:  float = 60.0   # relative humidity (%)
+    solar_wm2: Optional[float] = None  # solar irradiance W/m² (None = use seasonal model)
+
+class HolidayOverride(BaseModel):
+    """Override auto-detected holidays for forecast date."""
+    is_national_holiday: int = 0
+    is_major_festival:   int = 0
+    is_diwali_window:    int = 0
+    is_pre_festival:     int = 0
+
 class AllRegionsForecastRequest(BaseModel):
     # Optional: supply 168+ recent values per region for more accurate predictions.
     # If omitted, uses last 168 rows from data/demand.csv automatically.
@@ -240,6 +296,9 @@ class AllRegionsForecastRequest(BaseModel):
     NorthEastern_Region_mw:Optional[List[float]] = None
     demand_mw:             Optional[List[float]] = None
     start_datetime:        Optional[str] = None
+    # NEW: weather and holiday overrides from user input panel
+    weather_overrides: Optional[dict] = None   # region_col → WeatherOverride dict
+    holiday_overrides: Optional[HolidayOverride] = None
 
 
 class SingleRegionRequest(BaseModel):
@@ -271,16 +330,28 @@ def forecast_all_regions(req: AllRegionsForecastRequest):
         "NorthEastern_Region_mw": req.NorthEastern_Region_mw,
     }
 
+    # Parse user weather/holiday overrides from input panel
+    weather_overrides = req.weather_overrides or {}
+    holiday_override  = req.holiday_overrides.dict() if req.holiday_overrides else None
+
     results = {}
     errors  = {}
     all_india_predicted  = [0.0] * 24
     all_india_adjusted   = [0.0] * 24
 
-    cols_to_forecast = ["demand_mw"] + ALL_REGION_COLS
+    # FIX bug 4: In custom mode, skip demand_mw (national model) — the all_india
+    # aggregated series (sum of regions) is more accurate than an independently
+    # run national model on stale CSV data.
+    any_custom = any(v is not None for k, v in supplied.items() if k != "demand_mw")
+    cols_to_forecast = (ALL_REGION_COLS if any_custom else ["demand_mw"] + ALL_REGION_COLS)
 
     for col in cols_to_forecast:
         try:
-            data = _forecast_one_region(col, supplied.get(col), start_dt)
+            # Per-region weather override keyed by region_col
+            region_wx = weather_overrides.get(col)
+            data = _forecast_one_region(col, supplied.get(col), start_dt,
+                                         weather_override=region_wx,
+                                         holiday_override=holiday_override)
             results[col] = data
             if col != "demand_mw":
                 for i, f in enumerate(data["forecast"]):

@@ -11,15 +11,17 @@ from typing import List, Dict, Optional
 from dataclasses import dataclass, field
 
 # ── Installed capacities (MW) — CEA 2023-24 ─────────────────────────────────
+# Source: CEA Executive Summary July 2024 (cea.nic.in)
+# Verified totals: NR=127,353 WR=148,858 SR=130,944 ER=35,570 NER=5,496
 REGION_CAPACITIES_MW = {
-    "Northern_Region":      115000,
-    "Western_Region":       130000,
-    "Southern_Region":       95000,
-    "Eastern_Region":        55000,
-    "NorthEastern_Region":    4500,
-    "ALL_INDIA":            399500,
+    "Northern_Region":      127353,
+    "Western_Region":       148858,
+    "Southern_Region":      130944,
+    "Eastern_Region":        35570,
+    "NorthEastern_Region":    5496,
+    "ALL_INDIA":            448222,
 }
-DEFAULT_CAPACITY_MW = 399500
+DEFAULT_CAPACITY_MW = 448222
 
 # India demand segment shares (different from US/Europe)
 SEGMENT_SHARES = {

@@ -1,4 +1,5 @@
 {
+  "path": "model_Western_Region_mw.joblib",
   "feature_cols": [
     "lag_1h",
     "lag_2h",
@@ -34,5 +35,6 @@
     "weather_heat_index",
     "weather_cdh"
   ],
-  "n_features": 33
+  "n_features": 33,
+  "model_type": "lgbm"
 }

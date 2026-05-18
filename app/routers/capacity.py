@@ -82,23 +82,117 @@ def capacity_now(region: str = Query(default="Northern_Region")):
 
 @router.get("/24h")
 def capacity_24h(
-    region: str = Query(default="Northern_Region"),
-    month:  int = Query(default=None, ge=1, le=12),
+    region: str  = Query(default="Northern_Region"),
+    month:  int  = Query(default=None, ge=1, le=12),
+    # Optional per-hour weather arrays (comma-separated, 24 values each)
+    solar_wm2:  str = Query(default=None, description="Comma-separated solar irradiance per hour (W/m²)"),
+    temp_c:     str = Query(default=None, description="Comma-separated ambient temp per hour (°C)"),
+    wind_ms:    str = Query(default=None, description="Comma-separated wind speed per hour (m/s)"),
 ):
-    """24-hour dynamic capacity profile for one region — includes breakdown_mw per hour."""
+    """
+    24-hour dynamic capacity profile for one region.
+    Pass per-hour weather arrays to get weather-adjusted capacity.
+    Without weather, uses seasonal defaults.
+    """
     now   = _now_ist()
     month = month or now.month
     doy   = now.timetuple().tm_yday
 
+    def _parse_arr(s: str):
+        if not s: return None
+        try:
+            vals = [float(x.strip()) for x in s.split(",")]
+            return vals if len(vals) == 24 else None
+        except Exception:
+            return None
+
+    solar_arr = _parse_arr(solar_wm2)
+    temp_arr  = _parse_arr(temp_c)
+    wind_arr  = _parse_arr(wind_ms)
+
     hours = []
     for h in range(24):
-        cap = compute_dynamic_capacity(region, h, month, day_of_year=doy)
-        hours.append(_serialize_cap(cap, h, f"{h:02d}:00"))
+        cap = compute_dynamic_capacity(
+            region, h, month, day_of_year=doy,
+            solar_irradiance_wm2 = solar_arr[h] if solar_arr else None,
+            ambient_temp_c       = temp_arr[h]  if temp_arr  else None,
+            wind_speed_ms        = wind_arr[h]  if wind_arr  else None,
+        )
+        s = _serialize_cap(cap, h, f"{h:02d}:00")
+        s["weather"] = {
+            "solar_wm2":  round(solar_arr[h], 1) if solar_arr else None,
+            "temp_c":     round(temp_arr[h],  1) if temp_arr  else None,
+            "wind_ms":    round(wind_arr[h],  1) if wind_arr  else None,
+        }
+        hours.append(s)
+
+    return {"region": region, "month": month, "hours": hours, "weather_used": bool(solar_arr or temp_arr or wind_arr)}
+
+
+@router.get("/all-india-24h")
+def capacity_all_india_24h(
+    month:     int = Query(default=None, ge=1, le=12),
+    solar_wm2: str = Query(default=None),
+    temp_c:    str = Query(default=None),
+    wind_ms:   str = Query(default=None),
+):
+    """
+    24-hour All-India capacity profile: sums all 5 regions per hour.
+    Accepts per-hour weather arrays (comma-separated, 24 values).
+    This is the main endpoint for the capacity page chart.
+    """
+    now   = _now_ist()
+    month = month or now.month
+    doy   = now.timetuple().tm_yday
+
+    def _parse_arr(s: str):
+        if not s: return None
+        try:
+            vals = [float(x.strip()) for x in s.split(",")]
+            return vals if len(vals) == 24 else None
+        except Exception:
+            return None
+
+    solar_arr = _parse_arr(solar_wm2)
+    temp_arr  = _parse_arr(temp_c)
+    wind_arr  = _parse_arr(wind_ms)
+
+    hours = []
+    for h in range(24):
+        totals = {k: 0.0 for k in ["thermal","hydro","solar","wind","nuclear","other","total","installed"]}
+        for region in ALL_REGIONS:
+            cap = compute_dynamic_capacity(
+                region, h, month, day_of_year=doy,
+                solar_irradiance_wm2 = solar_arr[h] if solar_arr else None,
+                ambient_temp_c       = temp_arr[h]  if temp_arr  else None,
+                wind_speed_ms        = wind_arr[h]  if wind_arr  else None,
+            )
+            for src in ["thermal","hydro","solar","wind","nuclear","other"]:
+                totals[src] += cap.breakdown.get(src, 0)
+            totals["total"]     += cap.total_available_mw
+            totals["installed"] += cap.installed_total_mw
+
+        renewable = totals["solar"] + totals["wind"] + totals["hydro"]
+        hours.append({
+            "hour":              h,
+            "label":             f"{h:02d}:00",
+            "total_available_mw": round(totals["total"], 1),
+            "installed_total_mw": round(totals["installed"], 1),
+            "breakdown_mw": {k: round(totals[k], 1) for k in ["thermal","hydro","solar","wind","nuclear","other"]},
+            "renewable_mw":  round(renewable, 1),
+            "thermal_mw":    round(totals["thermal"], 1),
+            "renewable_pct": round(renewable / max(totals["total"], 1) * 100, 1),
+            "weather": {
+                "solar_wm2": round(solar_arr[h], 1) if solar_arr else None,
+                "temp_c":    round(temp_arr[h],  1) if temp_arr  else None,
+                "wind_ms":   round(wind_arr[h],  1) if wind_arr  else None,
+            },
+        })
 
     return {
-        "region": region,
-        "month":  month,
-        "hours":  hours,
+        "month":        month,
+        "weather_used": bool(solar_arr or temp_arr or wind_arr),
+        "hours":        hours,
     }
 
 
